@@ -1,0 +1,1441 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+╔══════════════════════════════════════════════════════════════════════════╗
+║        Technical Document Summarizer  v3.0  — STANDALONE                ║
+║        تلخيص الوثائق التقنية — نسخة مستقلة كاملة                       ║
+║                                                                          ║
+║  Algorithms  : TF-IDF · TextRank · LSA · Frequency-Based               ║
+║  Languages   : Arabic ✦ English (auto-detect)                           ║
+║  Import      : Word (.docx) · PDF (.pdf) · Plain Text (.txt)           ║
+║  Export      : Word (.docx) · PDF (.pdf)                                ║
+║  Metrics     : ROUGE-1/2/L · Topic Coverage · Key-Fact Retention       ║
+║               Compression · Lexical Diversity · Processing Time         ║
+║                                                                          ║
+║  pip install: pdfplumber python-docx scikit-learn networkx              ║
+║               numpy scipy reportlab                                      ║
+╚══════════════════════════════════════════════════════════════════════════╝
+"""
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import threading, os, re, time, json
+from collections import Counter
+from typing import Dict, List, Tuple, Optional
+import numpy as np
+
+# ── Optional heavy imports ────────────────────────────────────────────────
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.decomposition import TruncatedSVD
+    from sklearn.metrics.pairwise import cosine_similarity
+    import networkx as nx
+    ENGINE_OK = True
+except ImportError as e:
+    ENGINE_OK = False
+    ENGINE_ERROR = str(e)
+
+try:
+    import pdfplumber
+    PDF_OK = True
+except ImportError:
+    PDF_OK = False
+
+try:
+    from docx import Document as DocxDocument
+    DOCX_READ_OK = True
+except ImportError:
+    DOCX_READ_OK = False
+
+try:
+    from docx import Document as DocxDoc
+    from docx.shared import Pt, RGBColor, Inches
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    DOCX_WRITE_OK = True
+except ImportError:
+    DOCX_WRITE_OK = False
+
+try:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors as rl_colors
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.enums import TA_RIGHT, TA_LEFT, TA_CENTER
+    PDF_WRITE_OK = True
+except ImportError:
+    PDF_WRITE_OK = False
+
+
+# ══════════════════════════════════════════════════════════════
+#  THEME CONSTANTS
+# ══════════════════════════════════════════════════════════════
+
+LIGHT = {
+    "bg": "#F5F7FA", "sidebar": "#1A2B4A", "sidebar_txt": "#ECF0F6",
+    "sidebar_sel": "#2E86C1", "card": "#FFFFFF", "card_bdr": "#D9E2EC",
+    "primary": "#1A5C8A", "primary_dk": "#0D3A5C", "accent": "#2E86C1",
+    "success": "#27AE60", "warning": "#E67E22", "danger": "#E74C3C",
+    "text": "#1A1D23", "subtext": "#5A6370", "input_bg": "#FAFBFC",
+    "input_bdr": "#C8D0DA", "highlight": "#D6EAF8", "btn": "#1A5C8A",
+    "btn_txt": "#FFFFFF", "btn_hover": "#0D3A5C", "metric_bg": "#EBF5FB",
+    "metric_val": "#1A5C8A", "separator": "#D9E2EC",
+    "header_bg": "#1A2B4A", "header_txt": "#FFFFFF",
+}
+DARK = {
+    "bg": "#0F1923", "sidebar": "#080F18", "sidebar_txt": "#C8D8EC",
+    "sidebar_sel": "#1B6CA8", "card": "#182435", "card_bdr": "#243650",
+    "primary": "#2E86C1", "primary_dk": "#1B6CA8", "accent": "#3498DB",
+    "success": "#2ECC71", "warning": "#F39C12", "danger": "#E74C3C",
+    "text": "#E8EDF4", "subtext": "#8AA0BC", "input_bg": "#111E2E",
+    "input_bdr": "#243650", "highlight": "#1B3A5C", "btn": "#2E86C1",
+    "btn_txt": "#FFFFFF", "btn_hover": "#1B6CA8", "metric_bg": "#12253A",
+    "metric_val": "#3498DB", "separator": "#243650",
+    "header_bg": "#080F18", "header_txt": "#C8D8EC",
+}
+
+ALGO_COLORS = {
+    "TF-IDF Extractive":      "#185FA5",
+    "TextRank (Graph-Based)": "#0F6E56",
+    "LSA (Latent Semantic)":  "#854F0B",
+    "Frequency-Based":        "#993556",
+}
+
+
+# ══════════════════════════════════════════════════════════════
+#  ENGINE — TEXT PROCESSING + ALGORITHMS + METRICS
+# ══════════════════════════════════════════════════════════════
+
+class TextProcessor:
+    ARABIC_STOP = set([
+        'من','في','على','إلى','عن','مع','هذا','هذه','التي','الذي','أن','كل',
+        'كما','مثل','بعد','قبل','حتى','لأن','وهو','وهي','ما','هو','هي','لا',
+        'ولا','أو','بما','بين','وقد','مما','قد','لم','لن','منذ','حول','خلال',
+        'ذلك','تلك','هؤلاء','الذين','اللتي','ومن','وفي','وعلى','وإلى','وعن',
+        'وهذا','وهذه','وكان','وكانت','وتم','ويتم','وقال','وأضاف','وأشار',
+    ])
+    ENGLISH_STOP = set([
+        'the','a','an','and','or','but','in','on','at','to','for','of','with',
+        'by','from','up','about','into','through','is','are','was','were','be',
+        'been','being','have','has','had','do','does','did','will','would',
+        'could','should','may','might','must','can','that','this','these',
+        'those','it','its','they','them','their','we','our','us','you','your',
+        'he','she','his','her','i','my','me','which','who','whom','what',
+        'when','where','how','not','no','nor','so','yet','both','either',
+        'also','just','than','then','too','very','such','if','as','more',
+    ])
+
+    @staticmethod
+    def detect_language(text: str) -> str:
+        arabic_chars = len(re.findall(r'[\u0600-\u06FF]', text))
+        return "arabic" if arabic_chars > len(text) * 0.2 else "english"
+
+    @staticmethod
+    def normalize_arabic(text: str) -> str:
+        text = re.sub(r'[إأآا]', 'ا', text)
+        text = re.sub(r'ى', 'ي', text)
+        text = re.sub(r'ة', 'ه', text)
+        text = re.sub(r'\u0640', '', text)   # tatweel
+        text = re.sub(r'[\u064B-\u065F]', '', text)  # harakat
+        return text
+
+    @classmethod
+    def tokenize(cls, text: str, lang: str) -> List[str]:
+        if lang == "arabic":
+            text = cls.normalize_arabic(text)
+            tokens = re.findall(r'[\u0600-\u06FF]+', text)
+            stop = cls.ARABIC_STOP
+        else:
+            tokens = re.findall(r'\b[a-zA-Z]+\b', text.lower())
+            stop = cls.ENGLISH_STOP
+        return [t for t in tokens if t not in stop and len(t) > 2]
+
+    @staticmethod
+    def split_sentences(text: str) -> List[str]:
+        parts = re.split(r'(?<=[.!?؟])\s+|\n{2,}', text.strip())
+        return [s.strip() for s in parts if len(s.strip()) > 20]
+
+
+class Algorithms:
+    @staticmethod
+    def tfidf(text: str, ratio: float, lang: str) -> Tuple[str, dict]:
+        t0 = time.perf_counter()
+        sentences = TextProcessor.split_sentences(text)
+        if len(sentences) < 3:
+            return text, {"processing_time": time.perf_counter()-t0}
+        try:
+            pat = r'[\u0600-\u06FF]+' if lang=="arabic" else r'(?u)\b\w+\b'
+            vec = TfidfVectorizer(max_features=2000, token_pattern=pat)
+            mat = vec.fit_transform(sentences).toarray()
+            scores = mat.mean(axis=1)
+            n = max(2, int(len(sentences) * ratio))
+            idx = sorted(np.argsort(scores)[-n:])
+            summary = ' '.join(sentences[i] for i in idx)
+        except Exception as e:
+            summary = sentences[0] if sentences else text
+        return summary, {"processing_time": time.perf_counter()-t0}
+
+    @staticmethod
+    def textrank(text: str, ratio: float, lang: str) -> Tuple[str, dict]:
+        t0 = time.perf_counter()
+        sentences = TextProcessor.split_sentences(text)
+        if len(sentences) < 3:
+            return text, {"processing_time": time.perf_counter()-t0}
+        try:
+            pat = r'[\u0600-\u06FF]+' if lang=="arabic" else r'(?u)\b\w+\b'
+            vec = TfidfVectorizer(max_features=2000, token_pattern=pat)
+            mat = vec.fit_transform(sentences).toarray()
+            sim  = cosine_similarity(mat)
+            np.fill_diagonal(sim, 0)
+            G = nx.from_numpy_array(sim)
+            pr = nx.pagerank(G, max_iter=200, tol=1e-4)
+            scores = np.array([pr[i] for i in range(len(sentences))])
+            n = max(2, int(len(sentences) * ratio))
+            idx = sorted(np.argsort(scores)[-n:])
+            summary = ' '.join(sentences[i] for i in idx)
+        except Exception as e:
+            summary = sentences[0] if sentences else text
+        return summary, {"processing_time": time.perf_counter()-t0}
+
+    @staticmethod
+    def lsa(text: str, ratio: float, lang: str) -> Tuple[str, dict]:
+        t0 = time.perf_counter()
+        sentences = TextProcessor.split_sentences(text)
+        if len(sentences) < 3:
+            return text, {"processing_time": time.perf_counter()-t0}
+        try:
+            pat = r'[\u0600-\u06FF]+' if lang=="arabic" else r'(?u)\b\w+\b'
+            vec = TfidfVectorizer(max_features=2000, token_pattern=pat)
+            mat = vec.fit_transform(sentences).toarray()
+            n_comp = min(10, len(sentences)-1, mat.shape[1]-1)
+            if n_comp < 1:
+                return sentences[0], {"processing_time": time.perf_counter()-t0}
+            svd = TruncatedSVD(n_components=n_comp, random_state=42)
+            reduced = svd.fit_transform(mat)
+            scores = np.sqrt((reduced**2).sum(axis=1))
+            n = max(2, int(len(sentences) * ratio))
+            idx = sorted(np.argsort(scores)[-n:])
+            summary = ' '.join(sentences[i] for i in idx)
+        except Exception as e:
+            summary = sentences[0] if sentences else text
+        return summary, {"processing_time": time.perf_counter()-t0}
+
+    @staticmethod
+    def frequency(text: str, ratio: float, lang: str) -> Tuple[str, dict]:
+        t0 = time.perf_counter()
+        sentences = TextProcessor.split_sentences(text)
+        if len(sentences) < 3:
+            return text, {"processing_time": time.perf_counter()-t0}
+        all_tok = TextProcessor.tokenize(text, lang)
+        freq = Counter(all_tok)
+        maxf = max(freq.values(), default=1)
+        freq_n = {w: v/maxf for w, v in freq.items()}
+        scores = []
+        for s in sentences:
+            toks = TextProcessor.tokenize(s, lang)
+            sc = sum(freq_n.get(t, 0) for t in toks) / max(len(toks), 1)
+            scores.append(sc)
+        scores = np.array(scores)
+        n = max(2, int(len(sentences) * ratio))
+        idx = sorted(np.argsort(scores)[-n:])
+        summary = ' '.join(sentences[i] for i in idx)
+        return summary, {"processing_time": time.perf_counter()-t0}
+
+
+ALGORITHMS = {
+    "TF-IDF Extractive":      Algorithms.tfidf,
+    "TextRank (Graph-Based)": Algorithms.textrank,
+    "LSA (Latent Semantic)":  Algorithms.lsa,
+    "Frequency-Based":        Algorithms.frequency,
+}
+
+
+class MetricsCalculator:
+    @staticmethod
+    def _ngrams(tokens, n):
+        return Counter(tuple(tokens[i:i+n]) for i in range(len(tokens)-n+1))
+
+    @classmethod
+    def rouge_n(cls, hyp, ref, n):
+        h, r = cls._ngrams(hyp, n), cls._ngrams(ref, n)
+        ov = sum((h & r).values())
+        p = ov / max(sum(h.values()), 1)
+        rc = ov / max(sum(r.values()), 1)
+        f1 = 2*p*rc / max(p+rc, 1e-9)
+        return {"precision": round(p,4), "recall": round(rc,4), "f1": round(f1,4)}
+
+    @staticmethod
+    def rouge_l(hyp, ref):
+        m, n = len(hyp), len(ref)
+        dp = [[0]*(n+1) for _ in range(m+1)]
+        for i in range(1, m+1):
+            for j in range(1, n+1):
+                dp[i][j] = dp[i-1][j-1]+1 if hyp[i-1]==ref[j-1] else max(dp[i-1][j],dp[i][j-1])
+        lcs = dp[m][n]
+        p = lcs / max(m, 1)
+        rc = lcs / max(n, 1)
+        f1 = 2*p*rc / max(p+rc, 1e-9)
+        return {"precision": round(p,4), "recall": round(rc,4), "f1": round(f1,4)}
+
+    @staticmethod
+    def lexical_diversity(tokens):
+        return round(len(set(tokens)) / max(len(tokens), 1), 4)
+
+    @staticmethod
+    def topic_coverage(orig_sents, summ_sents, lang):
+        all_s = orig_sents + summ_sents
+        if len(all_s) < 2 or not ENGINE_OK:
+            return 0.0
+        try:
+            pat = r'[\u0600-\u06FF]+' if lang=="arabic" else r'(?u)\b\w+\b'
+            vec = TfidfVectorizer(max_features=500, token_pattern=pat)
+            mat = vec.fit_transform(all_s).toarray()
+            n = len(orig_sents)
+            sim = cosine_similarity(mat[n:], mat[:n])
+            covered = np.max(sim, axis=0)
+            return round(float(np.mean(covered > 0.15)), 4)
+        except:
+            return 0.0
+
+    @staticmethod
+    def key_fact_retention(orig_tok, summ_tok):
+        freq = Counter(orig_tok)
+        top30 = set(w for w, _ in freq.most_common(30))
+        return round(len(top30 & set(summ_tok)) / max(len(top30), 1), 4)
+
+    def compute_all(self, original: str, summary: str, proc_time: float,
+                    lang: str, algo_name: str = "") -> dict:
+        orig_tok  = TextProcessor.tokenize(original, lang)
+        summ_tok  = TextProcessor.tokenize(summary, lang)
+        orig_sent = TextProcessor.split_sentences(original)
+        summ_sent = TextProcessor.split_sentences(summary)
+
+        r1 = self.rouge_n(summ_tok, orig_tok, 1)
+        r2 = self.rouge_n(summ_tok, orig_tok, 2)
+        rl = self.rouge_l(summ_tok, orig_tok)
+
+        word_comp = (1 - len(summ_tok)/max(len(orig_tok),1)) * 100
+        sent_comp = (1 - len(summ_sent)/max(len(orig_sent),1)) * 100
+        tc  = self.topic_coverage(orig_sent, summ_sent, lang)
+        kfr = self.key_fact_retention(orig_tok, summ_tok)
+
+        return {
+            "algorithm":              algo_name,
+            "language":               lang,
+            "processing_time":        round(proc_time, 5),
+            "rouge_1":                r1,
+            "rouge_2":                r2,
+            "rouge_l":                rl,
+            "topic_coverage":         tc,
+            "key_fact_retention":     kfr,
+            "word_compression":       round(word_comp, 2),
+            "sentence_compression":   round(sent_comp, 2),
+            "lexical_diversity_orig": self.lexical_diversity(orig_tok),
+            "lexical_diversity_summ": self.lexical_diversity(summ_tok),
+            "original_sentences":     len(orig_sent),
+            "summary_sentences":      len(summ_sent),
+            "original_words":         len(orig_tok),
+            "summary_words":          len(summ_tok),
+            "original_chars":         len(original),
+            "summary_chars":          len(summary),
+        }
+
+
+class DocumentHandler:
+    def read_pdf(self, path: str) -> str:
+        if not PDF_OK:
+            raise ImportError("pdfplumber not installed. Run: pip install pdfplumber")
+        import pdfplumber
+        text = []
+        with pdfplumber.open(path) as pdf:
+            for page in pdf.pages:
+                t = page.extract_text()
+                if t:
+                    text.append(t)
+        return '\n\n'.join(text)
+
+    def read_docx(self, path: str) -> str:
+        if not DOCX_READ_OK:
+            raise ImportError("python-docx not installed. Run: pip install python-docx")
+        doc = DocxDocument(path)
+        return '\n\n'.join(p.text for p in doc.paragraphs if p.text.strip())
+
+    def export_docx(self, summary: str, source: str, metrics: dict, path: str, lang: str):
+        if not DOCX_WRITE_OK:
+            raise ImportError("python-docx not installed.")
+        doc = DocxDoc()
+        doc.add_heading("Document Summary  |  ملخص الوثيقة", 0)
+        if source:
+            doc.add_paragraph(f"Source: {os.path.basename(source)}")
+        doc.add_heading("Summary  |  الملخص", 1)
+        p = doc.add_paragraph(summary)
+        if lang == "arabic":
+            p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        doc.add_heading("Metrics  |  المقاييس", 1)
+        r1 = metrics.get("rouge_1", {})
+        r2 = metrics.get("rouge_2", {})
+        rl = metrics.get("rouge_l", {})
+        rows = [
+            ("Algorithm", metrics.get("algorithm","—")),
+            ("Language", metrics.get("language","—")),
+            ("ROUGE-1 F1", f"{r1.get('f1',0):.4f}"),
+            ("ROUGE-2 F1", f"{r2.get('f1',0):.4f}"),
+            ("ROUGE-L F1", f"{rl.get('f1',0):.4f}"),
+            ("Topic Coverage", f"{metrics.get('topic_coverage',0):.4f}"),
+            ("Key-Fact Retention", f"{metrics.get('key_fact_retention',0):.4f}"),
+            ("Word Compression", f"{metrics.get('word_compression',0):.1f}%"),
+            ("Processing Time", f"{metrics.get('processing_time',0):.4f}s"),
+        ]
+        table = doc.add_table(rows=len(rows)+1, cols=2)
+        table.style = "Table Grid"
+        hdr = table.rows[0].cells
+        hdr[0].text, hdr[1].text = "Metric", "Value"
+        for i, (k, v) in enumerate(rows):
+            table.rows[i+1].cells[0].text = k
+            table.rows[i+1].cells[1].text = v
+        doc.save(path)
+
+    def export_pdf(self, summary: str, source: str, metrics: dict, path: str, lang: str):
+        if not PDF_WRITE_OK:
+            raise ImportError("reportlab not installed.")
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib import colors as rl_colors
+        from reportlab.lib.enums import TA_RIGHT, TA_LEFT
+
+        doc = SimpleDocTemplate(path, pagesize=A4,
+                                rightMargin=40, leftMargin=40,
+                                topMargin=50, bottomMargin=40)
+        styles = getSampleStyleSheet()
+        story = []
+        title_style = ParagraphStyle("title", fontSize=16, fontName="Helvetica-Bold",
+                                     spaceAfter=12, textColor=rl_colors.HexColor("#1A5C8A"))
+        body_style = ParagraphStyle("body", fontSize=11, fontName="Helvetica",
+                                    leading=16, spaceAfter=8,
+                                    alignment=TA_RIGHT if lang=="arabic" else TA_LEFT)
+        story.append(Paragraph("Document Summary | ملخص الوثيقة", title_style))
+        if source:
+            story.append(Paragraph(f"Source: {os.path.basename(source)}", styles["Normal"]))
+        story.append(Spacer(1, 12))
+        story.append(Paragraph("Summary | الملخص", title_style))
+        for para in summary.split('\n'):
+            if para.strip():
+                story.append(Paragraph(para.strip(), body_style))
+        story.append(Spacer(1, 16))
+        story.append(Paragraph("Metrics | المقاييس", title_style))
+        r1 = metrics.get("rouge_1", {})
+        r2 = metrics.get("rouge_2", {})
+        rl = metrics.get("rouge_l", {})
+        data = [["Metric", "Value"],
+                ["Algorithm", str(metrics.get("algorithm","—"))],
+                ["ROUGE-1 F1", f"{r1.get('f1',0):.4f}"],
+                ["ROUGE-2 F1", f"{r2.get('f1',0):.4f}"],
+                ["ROUGE-L F1", f"{rl.get('f1',0):.4f}"],
+                ["Topic Coverage", f"{metrics.get('topic_coverage',0):.4f}"],
+                ["Key-Fact Retention", f"{metrics.get('key_fact_retention',0):.4f}"],
+                ["Word Compression", f"{metrics.get('word_compression',0):.1f}%"],
+                ["Processing Time", f"{metrics.get('processing_time',0):.4f}s"]]
+        t = Table(data, colWidths=[200, 200])
+        t.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,0), rl_colors.HexColor("#1A5C8A")),
+            ("TEXTCOLOR",  (0,0), (-1,0), rl_colors.white),
+            ("FONTNAME",   (0,0), (-1,0), "Helvetica-Bold"),
+            ("BACKGROUND", (0,1), (-1,-1), rl_colors.HexColor("#EBF5FB")),
+            ("ROWBACKGROUNDS", (0,1), (-1,-1),
+             [rl_colors.HexColor("#EBF5FB"), rl_colors.white]),
+            ("GRID", (0,0), (-1,-1), 0.5, rl_colors.HexColor("#C8D0DA")),
+            ("FONTSIZE", (0,0), (-1,-1), 10),
+            ("PADDING", (0,0), (-1,-1), 6),
+        ]))
+        story.append(t)
+        doc.build(story)
+
+
+# ══════════════════════════════════════════════════════════════
+#  CUSTOM WIDGETS
+# ══════════════════════════════════════════════════════════════
+
+class ModernButton(tk.Canvas):
+    def __init__(self, parent, text="", command=None, icon="",
+                 width=160, height=36, radius=8,
+                 bg="#1A5C8A", fg="#FFFFFF", hover_bg="#0D3A5C",
+                 font_size=10, **kwargs):
+        super().__init__(parent, width=width, height=height,
+                         bd=0, highlightthickness=0, **kwargs)
+        self._command  = command
+        self._orig_cmd = command
+        self._bg       = bg
+        self._hover    = hover_bg
+        self._fg       = fg
+        self._label    = f"{icon}  {text}" if icon else text
+        self._r        = radius
+        self._bw       = width
+        self._bh       = height
+        self._fs       = font_size
+        self._drawn    = False
+        # Draw only after widget is mapped (works on Windows)
+        self.bind("<Map>",      lambda e: self._first_draw())
+        self.bind("<Enter>",    lambda e: self._safe_draw(hover_bg))
+        self.bind("<Leave>",    lambda e: self._safe_draw(bg))
+        self.bind("<Button-1>", lambda e: self._command() if self._command else None)
+
+    def _first_draw(self):
+        if not self._drawn:
+            self._drawn = True
+            self._draw(self._bg)
+
+    def _safe_draw(self, color):
+        try:
+            if self.winfo_exists():
+                self._draw(color)
+        except Exception:
+            pass
+
+    def _draw(self, color):
+        try:
+            if not self.winfo_exists():
+                return
+            self.delete("all")
+            r, w, h = self._r, self._bw, self._bh
+            for args in [
+                (0,0,2*r,2*r,90,90),(w-2*r,0,w,2*r,0,90),
+                (0,h-2*r,2*r,h,180,90),(w-2*r,h-2*r,w,h,270,90)
+            ]:
+                self.create_arc(*args[:4], start=args[4], extent=args[5],
+                                fill=color, outline=color)
+            self.create_rectangle(r,0,w-r,h, fill=color, outline=color)
+            self.create_rectangle(0,r,w,h-r, fill=color, outline=color)
+            self.create_text(w//2, h//2, text=self._label, fill=self._fg,
+                             font=("Segoe UI", self._fs, "bold"))
+        except Exception:
+            pass
+
+    def set_state(self, state):
+        if state == "disabled":
+            self._safe_draw("#888888")
+            self._command = None
+        else:
+            self._safe_draw(self._bg)
+            self._command = self._orig_cmd
+
+    def set_command(self, cmd):
+        self._orig_cmd = cmd
+        self._command  = cmd
+        self._command = cmd
+
+
+class MetricCard(tk.Frame):
+    def __init__(self, parent, label="", value="—", theme=LIGHT, **kwargs):
+        super().__init__(parent, bg=theme["metric_bg"],
+                         relief="flat", bd=0, padx=10, pady=6, **kwargs)
+        tk.Label(self, text=label, bg=theme["metric_bg"],
+                 fg=theme["subtext"], font=("Segoe UI", 8)).pack(anchor="w")
+        self._val = tk.Label(self, text=value, bg=theme["metric_bg"],
+                             fg=theme["metric_val"],
+                             font=("Segoe UI", 13, "bold"))
+        self._val.pack(anchor="w")
+
+    def update_value(self, v):
+        self._val.config(text=str(v))
+
+    def update_theme(self, theme):
+        self.configure(bg=theme["metric_bg"])
+        for w in self.winfo_children():
+            if isinstance(w, tk.Label):
+                w.configure(bg=theme["metric_bg"])
+        self._val.configure(fg=theme["metric_val"])
+
+
+class SectionHeader(tk.Frame):
+    def __init__(self, parent, text, theme=LIGHT, **kwargs):
+        super().__init__(parent, bg=theme["sidebar"], **kwargs)
+        tk.Label(self, text=text, bg=theme["sidebar"],
+                 fg=theme["sidebar_txt"],
+                 font=("Segoe UI", 9, "bold")).pack(side="left", padx=(0, 8))
+        tk.Frame(self, bg=theme["sidebar_sel"], height=1).pack(
+            side="left", fill="x", expand=True, pady=8)
+
+
+# ══════════════════════════════════════════════════════════════
+#  MAIN APPLICATION
+# ══════════════════════════════════════════════════════════════
+
+class SummarizerApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Technical Document Summarizer v3.0  |  تلخيص الوثائق التقنية")
+        self.geometry("1360x860")
+        self.minsize(1000, 650)
+
+        self.theme         = LIGHT
+        self.dark_mode     = False
+        self.current_file  = ""
+        self.original_txt  = ""
+        self.summary_txt   = ""
+        self.metrics_data  : Dict = {}
+        self.is_running    = False
+        self.history       = []
+        self._compare_data : Dict = {}
+        self.calc          = MetricsCalculator()
+        self.doc_handler   = DocumentHandler()
+
+        # Initialize StringVars BEFORE _build_ui so callbacks never crash
+        self.status_var    = tk.StringVar(value="Ready  |  جاهز")
+        self.wc_var        = tk.StringVar(value="0 words")
+        self.progress_var  = tk.DoubleVar(value=0)
+        self.lang_var      = tk.StringVar(value="auto")
+        self.algo_var      = tk.StringVar(value="TextRank (Graph-Based)")
+        self.ratio_var     = tk.DoubleVar(value=0.30)
+        self.compare_var   = tk.BooleanVar(value=False)
+
+        self._build_ui()
+        self._apply_theme()
+
+        if not ENGINE_OK:
+            messagebox.showerror("Missing Packages",
+                f"Required packages missing:\n{ENGINE_ERROR}\n\n"
+                "pip install scikit-learn networkx numpy scipy")
+
+    # ──────────────────────────────────────────────────────────
+    #  BUILD UI
+    # ──────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        self.grid_rowconfigure(1, weight=1)
+        self.grid_columnconfigure(1, weight=1)
+        self._build_header()
+        self._build_sidebar()
+        self._build_main()
+        self._build_statusbar()
+
+    def _build_header(self):
+        self.header = tk.Frame(self, height=52)
+        self.header.grid(row=0, column=0, columnspan=2, sticky="ew")
+        self.header.grid_propagate(False)
+
+        tk.Label(self.header, text="📄",
+                 font=("Segoe UI Emoji", 18)).pack(side="left", padx=(16,4))
+        tk.Label(self.header, text="Technical Document Summarizer  |  تلخيص الوثائق التقنية",
+                 font=("Segoe UI", 12, "bold")).pack(side="left")
+
+        ctrl = tk.Frame(self.header)
+        ctrl.pack(side="right", padx=12)
+
+        self.dark_btn = tk.Button(
+            ctrl, text="🌙 Dark", relief="flat", bd=0, cursor="hand2",
+            font=("Segoe UI", 9), padx=8, pady=4, command=self._toggle_theme)
+        self.dark_btn.pack(side="right", padx=4)
+
+        tk.Button(ctrl, text="❓ Help", relief="flat", bd=0, cursor="hand2",
+                  font=("Segoe UI", 9), padx=8, pady=4,
+                  command=self._show_help).pack(side="right", padx=4)
+
+    def _build_sidebar(self):
+        self.sidebar = tk.Frame(self, width=280)
+        self.sidebar.grid(row=1, column=0, sticky="nsew")
+        self.sidebar.grid_propagate(False)
+
+        cvs = tk.Canvas(self.sidebar, bd=0, highlightthickness=0)
+        scr = tk.Scrollbar(self.sidebar, orient="vertical", command=cvs.yview)
+        self.sb_inner = tk.Frame(cvs)
+        cvs.configure(yscrollcommand=scr.set)
+        cvs.pack(side="left", fill="both", expand=True)
+        scr.pack(side="right", fill="y")
+        win = cvs.create_window((0,0), window=self.sb_inner, anchor="nw")
+        cvs.bind('<Configure>', lambda e: cvs.itemconfig(win, width=e.width))
+        self.sb_inner.bind('<Configure>',
+            lambda e: cvs.configure(scrollregion=cvs.bbox("all")))
+        cvs.bind_all("<MouseWheel>",
+            lambda e: cvs.yview_scroll(int(-1*(e.delta/120)), "units"))
+        self._build_sidebar_content()
+
+    def _build_sidebar_content(self):
+        p = self.sb_inner
+        pad = dict(padx=14, pady=4)
+
+        # ── IMPORT
+        tk.Label(p, text="📂  Import / استيراد", font=("Segoe UI",9,"bold"),
+                 anchor="w").pack(fill="x", padx=14, pady=(14,2))
+        tk.Frame(p, height=1).pack(fill="x", padx=14, pady=(0,4))
+
+        self.file_label = tk.Label(p, text="No file selected",
+                                   font=("Segoe UI",8), wraplength=240,
+                                   justify="left", anchor="w")
+        self.file_label.pack(fill="x", padx=14, pady=(0,3))
+
+        row = tk.Frame(p)
+        row.pack(fill="x", **pad)
+        tk.Button(row, text="📄 Word / PDF", font=("Segoe UI",9),
+                  cursor="hand2", relief="flat", bd=1,
+                  command=self._import_file).pack(side="left", expand=True,
+                                                   fill="x", padx=(0,3))
+        tk.Button(row, text="📋 Paste Text", font=("Segoe UI",9),
+                  cursor="hand2", relief="flat", bd=1,
+                  command=self._paste_text).pack(side="left", expand=True,
+                                                  fill="x", padx=(3,0))
+
+        # ── LANGUAGE
+        tk.Label(p, text="🌐  Language / اللغة", font=("Segoe UI",9,"bold"),
+                 anchor="w").pack(fill="x", padx=14, pady=(12,2))
+        tk.Frame(p, height=1).pack(fill="x", padx=14, pady=(0,4))
+
+        lf = tk.Frame(p)
+        lf.pack(fill="x", padx=14, pady=2)
+        for lbl, val in [("🔍 Auto-detect","auto"),("🇸🇦 Arabic","arabic"),("🇺🇸 English","english")]:
+            tk.Radiobutton(lf, text=lbl, variable=self.lang_var, value=val,
+                           font=("Segoe UI",9), cursor="hand2").pack(anchor="w")
+
+        # ── ALGORITHM
+        tk.Label(p, text="⚙️  Algorithm / الخوارزمية", font=("Segoe UI",9,"bold"),
+                 anchor="w").pack(fill="x", padx=14, pady=(12,2))
+        tk.Frame(p, height=1).pack(fill="x", padx=14, pady=(0,4))
+
+        af = tk.Frame(p)
+        af.pack(fill="x", padx=14, pady=2)
+        algo_info = {
+            "TF-IDF Extractive":       "Fast · High precision",
+            "TextRank (Graph-Based)":  "Best quality · Graph",
+            "LSA (Latent Semantic)":   "Topic-aware · SVD",
+            "Frequency-Based":         "Fastest · Baseline",
+        }
+        for name, info in algo_info.items():
+            row2 = tk.Frame(af)
+            row2.pack(fill="x", pady=1)
+            c = ALGO_COLORS.get(name, "#555")
+            tk.Label(row2, text="●", fg=c, font=("Segoe UI",12),
+                     bg=self.theme["sidebar"]).pack(side="left")
+            tk.Radiobutton(row2, text=name, variable=self.algo_var,
+                           value=name, font=("Segoe UI",9),
+                           cursor="hand2").pack(side="left")
+            tk.Label(row2, text=f"({info})",
+                     font=("Segoe UI",7), fg="#AAA").pack(side="left")
+
+        # ── COMPARE
+        self.compare_cb = tk.Checkbutton(p, text="🔀 Compare ALL algorithms",
+                                         variable=self.compare_var,
+                                         font=("Segoe UI",9), cursor="hand2")
+        self.compare_cb.pack(anchor="w", padx=14, pady=(10,2))
+
+        # ── RATIO
+        tk.Label(p, text="📏  Summary Ratio / نسبة الملخص",
+                 font=("Segoe UI",9,"bold"), anchor="w").pack(
+                     fill="x", padx=14, pady=(12,2))
+        tk.Frame(p, height=1).pack(fill="x", padx=14, pady=(0,4))
+
+        ratio_f = tk.Frame(p)
+        ratio_f.pack(fill="x", padx=14, pady=2)
+        self.ratio_var = tk.DoubleVar(value=0.30)
+        self.ratio_lbl = tk.Label(ratio_f, text="30%",
+                                   font=("Segoe UI",10,"bold"), width=4)
+        self.ratio_lbl.pack(side="right")
+        ttk.Scale(ratio_f, from_=0.10, to=0.70, variable=self.ratio_var,
+                  orient="horizontal",
+                  command=lambda v: self.ratio_lbl.config(
+                      text=f"{int(float(v)*100)}%")).pack(fill="x", expand=True)
+
+        # ── RUN BUTTON
+        tk.Label(p, text="▶  Actions / إجراءات",
+                 font=("Segoe UI",9,"bold"), anchor="w").pack(
+                     fill="x", padx=14, pady=(14,2))
+        tk.Frame(p, height=1).pack(fill="x", padx=14, pady=(0,4))
+
+        self.run_btn = ModernButton(p, text="Summarize", icon="✨",
+                                    command=self._run_summarization,
+                                    width=248, height=40, radius=8, font_size=11)
+        self.run_btn.set_command(self._run_summarization)
+        self.run_btn.pack(padx=14, pady=(4,2))
+
+        tk.Button(p, text="🗑  Clear All", font=("Segoe UI",9),
+                  cursor="hand2", relief="flat", bd=1, pady=4,
+                  command=self._clear_all).pack(fill="x", padx=14, pady=2)
+
+        # ── EXPORT
+        tk.Label(p, text="💾  Export / تصدير",
+                 font=("Segoe UI",9,"bold"), anchor="w").pack(
+                     fill="x", padx=14, pady=(12,2))
+        tk.Frame(p, height=1).pack(fill="x", padx=14, pady=(0,4))
+
+        exp_f = tk.Frame(p)
+        exp_f.pack(fill="x", padx=14, pady=2)
+        tk.Button(exp_f, text="📝 DOCX", font=("Segoe UI",9),
+                  cursor="hand2", relief="flat", bd=1, pady=4,
+                  command=lambda: self._export("docx")).pack(
+                      side="left", expand=True, fill="x", padx=(0,3))
+        tk.Button(exp_f, text="📄 PDF", font=("Segoe UI",9),
+                  cursor="hand2", relief="flat", bd=1, pady=4,
+                  command=lambda: self._export("pdf")).pack(
+                      side="left", expand=True, fill="x", padx=(3,0))
+
+        # ── HISTORY
+        tk.Label(p, text="🕑  History / السجل",
+                 font=("Segoe UI",9,"bold"), anchor="w").pack(
+                     fill="x", padx=14, pady=(12,2))
+        tk.Frame(p, height=1).pack(fill="x", padx=14, pady=(0,4))
+
+        self.history_list = tk.Listbox(p, height=5, font=("Segoe UI",8),
+                                        relief="flat", bd=1, activestyle="none")
+        self.history_list.pack(fill="x", padx=14, pady=(0,10))
+        self.history_list.bind("<<ListboxSelect>>", self._load_history)
+
+    def _build_main(self):
+        self.main = tk.Frame(self)
+        self.main.grid(row=1, column=1, sticky="nsew")
+        self.main.grid_rowconfigure(0, weight=1)
+        self.main.grid_columnconfigure(0, weight=1)
+
+        self.notebook = ttk.Notebook(self.main)
+        self.notebook.pack(fill="both", expand=True, padx=6, pady=6)
+
+        self.editor_tab  = tk.Frame(self.notebook)
+        self.metrics_tab = tk.Frame(self.notebook)
+        self.compare_tab = tk.Frame(self.notebook)
+
+        self.notebook.add(self.editor_tab,  text="  📝 Editor  ")
+        self.notebook.add(self.metrics_tab, text="  📊 Metrics  ")
+        self.notebook.add(self.compare_tab, text="  🔀 Compare All  ")
+
+        self._build_editor_tab()
+        self._build_metrics_tab()
+        self._build_compare_tab()
+
+    def _build_editor_tab(self):
+        p = self.editor_tab
+        p.grid_rowconfigure(1, weight=1)
+        p.grid_columnconfigure(0, weight=1)
+        p.grid_columnconfigure(1, weight=1)
+
+        self.progress_var = tk.DoubleVar(value=0)
+        ttk.Progressbar(p, variable=self.progress_var, maximum=100,
+                        mode="determinate").grid(
+            row=0, column=0, columnspan=2, sticky="ew", padx=8, pady=(6,2))
+
+        # Original
+        tk.Label(p, text="📄 Original Text  |  النص الأصلي",
+                 font=("Segoe UI",9,"bold"), anchor="w").grid(
+                     row=1, column=0, sticky="ew", padx=(8,4), pady=(4,2))
+        self.orig_text = self._make_text(p, row=2, col=0, editable=True)
+
+        # Summary
+        tk.Label(p, text="✅ Summary  |  الملخص",
+                 font=("Segoe UI",9,"bold"), anchor="w").grid(
+                     row=1, column=1, sticky="ew", padx=(4,8), pady=(4,2))
+        self.summ_text = self._make_text(p, row=2, col=1, editable=False)
+
+    def _make_text(self, parent, row, col, editable):
+        f = tk.Frame(parent, bd=1, relief="solid")
+        f.grid(row=row, column=col, sticky="nsew", padx=(8 if col==0 else 4, 4 if col==0 else 8), pady=(0,8))
+        f.grid_rowconfigure(0, weight=1)
+        f.grid_columnconfigure(0, weight=1)
+        t = tk.Text(f, wrap="word", font=("Segoe UI",11), padx=10, pady=8,
+                    relief="flat", bd=0, undo=True,
+                    state="normal" if editable else "disabled")
+        vsb = ttk.Scrollbar(f, orient="vertical", command=t.yview)
+        t.configure(yscrollcommand=vsb.set)
+        t.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        if editable:
+            t.bind("<KeyRelease>", self._update_wc)
+        return t
+
+    def _build_metrics_tab(self):
+        p = self.metrics_tab
+        p.grid_columnconfigure((0,1,2), weight=1)
+        p.grid_rowconfigure(3, weight=1)
+
+        # ── ROUGE
+        rf = tk.LabelFrame(p, text=" ROUGE Scores ", padx=10, pady=10)
+        rf.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
+        self.rouge_cards = {}
+        for i, (lbl, key) in enumerate([
+            ("ROUGE-1 F1","r1f"),("ROUGE-2 F1","r2f"),("ROUGE-L F1","rlf"),
+            ("ROUGE-1 Prec","r1p"),("ROUGE-1 Rec","r1r"),("ROUGE-2 Prec","r2p"),
+        ]):
+            c = MetricCard(rf, label=lbl, value="—", theme=self.theme)
+            c.grid(row=i//2, column=i%2, padx=4, pady=3, sticky="ew")
+            self.rouge_cards[key] = c
+
+        # ── SEMANTIC
+        sf = tk.LabelFrame(p, text=" Semantic Quality ", padx=10, pady=10)
+        sf.grid(row=0, column=1, sticky="nsew", padx=6, pady=6)
+        self.sem_cards = {}
+        for i, (lbl, key) in enumerate([
+            ("Topic Coverage","tc"),("Key-Fact Retention","kfr"),
+            ("Lex Diversity (orig)","ldo"),("Lex Diversity (summ)","lds"),
+        ]):
+            c = MetricCard(sf, label=lbl, value="—", theme=self.theme)
+            c.grid(row=i//2, column=i%2, padx=4, pady=3, sticky="ew")
+            self.sem_cards[key] = c
+
+        # ── STATS
+        stf = tk.LabelFrame(p, text=" Compression & Stats ", padx=10, pady=10)
+        stf.grid(row=0, column=2, sticky="nsew", padx=6, pady=6)
+        self.stat_cards = {}
+        for i, (lbl, key) in enumerate([
+            ("Word Compression","wcomp"),("Sent Compression","scomp"),
+            ("Original Words","owds"),("Summary Words","swds"),
+            ("Original Sents","osnt"),("Summary Sents","ssnt"),
+        ]):
+            c = MetricCard(stf, label=lbl, value="—", theme=self.theme)
+            c.grid(row=i//2, column=i%2, padx=4, pady=3, sticky="ew")
+            self.stat_cards[key] = c
+
+        # ── GAUGE
+        gf = tk.LabelFrame(p, text=" Quality Gauge — ROUGE-L F1 ", padx=10, pady=8)
+        gf.grid(row=1, column=0, columnspan=3, sticky="ew", padx=6, pady=4)
+        tk.Label(gf, text="Overall quality:").pack(side="left")
+        self.quality_bar = ttk.Progressbar(gf, maximum=1.0, mode="determinate",
+                                            length=500)
+        self.quality_bar.pack(side="left", padx=10)
+        self.quality_pct = tk.Label(gf, text="0.0%", font=("Segoe UI",10,"bold"))
+        self.quality_pct.pack(side="left")
+
+        # ── PERF
+        pf = tk.LabelFrame(p, text=" Performance ", padx=10, pady=10)
+        pf.grid(row=2, column=0, columnspan=3, sticky="ew", padx=6, pady=4)
+        self.perf_cards = {}
+        for i, (lbl, key) in enumerate([
+            ("Algorithm","algo"),("Language","lang"),
+            ("Processing Time","time"),("Orig Chars","och"),("Summ Chars","sch"),
+        ]):
+            c = MetricCard(pf, label=lbl, value="—", theme=self.theme)
+            c.grid(row=0, column=i, padx=6, pady=3, sticky="ew")
+            self.perf_cards[key] = c
+
+        # ── RAW JSON
+        jf = tk.LabelFrame(p, text=" Raw JSON ", padx=6, pady=4)
+        jf.grid(row=3, column=0, columnspan=3, sticky="nsew", padx=6, pady=(4,8))
+        jf.grid_rowconfigure(0, weight=1)
+        jf.grid_columnconfigure(0, weight=1)
+        self.raw_text = tk.Text(jf, font=("Consolas",9), state="disabled",
+                                relief="flat", height=6)
+        vsb = ttk.Scrollbar(jf, orient="vertical", command=self.raw_text.yview)
+        self.raw_text.configure(yscrollcommand=vsb.set)
+        self.raw_text.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+
+    def _build_compare_tab(self):
+        p = self.compare_tab
+        p.grid_rowconfigure(2, weight=1)
+        p.grid_columnconfigure(0, weight=1)
+
+        # Info label
+        tk.Label(p, text="Algorithm Comparison  |  مقارنة الخوارزميات",
+                 font=("Segoe UI",12,"bold")).grid(
+                     row=0, column=0, columnspan=2,
+                     sticky="w", padx=12, pady=(10,2))
+        tk.Label(p, text="Enable 'Compare ALL algorithms' in the sidebar, then click Summarize.",
+                 font=("Segoe UI",9), fg="#888").grid(
+                     row=0, column=1, sticky="e", padx=12)
+
+        # ── Comparison Table
+        cols = ("Algorithm","ROUGE-1","ROUGE-2","ROUGE-L",
+                "Topic Cov.","Key Facts","Compression","Time (ms)","Words")
+        self.compare_tree = ttk.Treeview(p, columns=cols, show="headings", height=6)
+        for col in cols:
+            self.compare_tree.heading(col, text=col,
+                command=lambda c=col: self._sort_tree(c))
+            w = 160 if col == "Algorithm" else 85
+            self.compare_tree.column(col, width=w, anchor="center" if col!="Algorithm" else "w")
+
+        vsb2 = ttk.Scrollbar(p, orient="vertical", command=self.compare_tree.yview)
+        self.compare_tree.configure(yscrollcommand=vsb2.set)
+        self.compare_tree.grid(row=1, column=0, sticky="nsew", padx=(10,0), pady=6)
+        vsb2.grid(row=1, column=1, sticky="ns", pady=6, padx=(0,10))
+
+        # ── Best Algo Panel
+        best_f = tk.LabelFrame(p, text=" 🏆 Winner / الفائز ", padx=10, pady=8)
+        best_f.grid(row=2, column=0, columnspan=2, sticky="ew", padx=10, pady=(0,6))
+        self.winner_label = tk.Label(best_f, text="—", font=("Segoe UI",11,"bold"),
+                                      fg="#27AE60")
+        self.winner_label.pack(side="left", padx=8)
+        self.winner_detail = tk.Label(best_f, text="", font=("Segoe UI",9),
+                                       fg="#555", wraplength=900, justify="left")
+        self.winner_detail.pack(side="left", fill="x", expand=True)
+
+        # ── Selected summary preview
+        tk.Label(p, text="Selected Algorithm Summary  |  ملخص الخوارزمية المختارة:",
+                 font=("Segoe UI",9,"bold")).grid(
+                     row=3, column=0, sticky="w", padx=12, pady=(4,0))
+        self.compare_summ = tk.Text(p, height=8, font=("Segoe UI",10),
+                                     relief="flat", bd=1, wrap="word",
+                                     state="disabled")
+        self.compare_summ.grid(row=4, column=0, columnspan=2,
+                                sticky="ew", padx=10, pady=(0,10))
+        self.compare_tree.bind("<<TreeviewSelect>>", self._show_compare_summary)
+
+    def _build_statusbar(self):
+        self.statusbar = tk.Frame(self, height=26)
+        self.statusbar.grid(row=2, column=0, columnspan=2, sticky="ew")
+        self.statusbar.grid_propagate(False)
+        tk.Label(self.statusbar, textvariable=self.status_var,
+                 font=("Segoe UI",8), anchor="w").pack(side="left", padx=10)
+        tk.Label(self.statusbar, textvariable=self.wc_var,
+                 font=("Segoe UI",8)).pack(side="right", padx=10)
+
+    # ──────────────────────────────────────────────────────────
+    #  IMPORT
+    # ──────────────────────────────────────────────────────────
+
+    def _import_file(self):
+        path = filedialog.askopenfilename(
+            title="Open Document",
+            filetypes=[("Supported","*.docx *.pdf *.txt"),
+                       ("Word","*.docx"),("PDF","*.pdf"),("Text","*.txt")])
+        if not path:
+            return
+        self._set_status(f"Loading: {os.path.basename(path)} …")
+        self.current_file = path
+        try:
+            ext = os.path.splitext(path)[1].lower()
+            if ext == ".pdf":
+                text = self.doc_handler.read_pdf(path)
+            elif ext == ".docx":
+                text = self.doc_handler.read_docx(path)
+            else:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    text = f.read()
+            self._set_original(text)
+            self.file_label.config(text=f"📎 {os.path.basename(path)}")
+            self._set_status(f"Loaded: {os.path.basename(path)} ({len(text):,} chars)")
+        except Exception as e:
+            messagebox.showerror("Import Error", str(e))
+            self._set_status("Import failed")
+
+    def _paste_text(self):
+        win = tk.Toplevel(self)
+        win.title("Paste / Type Text  |  لصق أو كتابة النص")
+        win.geometry("660x450")
+        win.grab_set()
+        tk.Label(win, text="Paste or type your text  |  الصق النص هنا:",
+                 font=("Segoe UI",10)).pack(padx=12, pady=(12,4), anchor="w")
+        tb = tk.Text(win, font=("Segoe UI",10), wrap="word", padx=8, pady=6)
+        tb.pack(fill="both", expand=True, padx=12, pady=4)
+
+        def apply():
+            t = tb.get("1.0","end").strip()
+            if t:
+                self._set_original(t)
+                self.current_file = ""
+                self.file_label.config(text="(Pasted text)")
+                self._set_status(f"Text loaded ({len(t):,} chars)")
+            win.destroy()
+
+        ModernButton(win, text="Use this text", icon="✅",
+                     command=apply, width=190, height=36).pack(pady=8)
+
+    def _set_original(self, text: str):
+        self.original_txt = text
+        self.orig_text.config(state="normal")
+        self.orig_text.delete("1.0","end")
+        self.orig_text.insert("1.0", text)
+        self._update_wc()
+
+    # ──────────────────────────────────────────────────────────
+    #  SUMMARIZATION
+    # ──────────────────────────────────────────────────────────
+
+    def _run_summarization(self):
+        if self.is_running:
+            return
+        text = self.orig_text.get("1.0","end").strip()
+        if not text:
+            messagebox.showwarning("No Text", "Please import or paste text first.\nالرجاء إدخال نص أولاً.")
+            return
+        self.is_running = True
+        self.run_btn.set_state("disabled")
+        self._set_status("⏳ Processing …")
+        self.progress_var.set(0)
+        threading.Thread(target=self._do_summarize, args=(text,), daemon=True).start()
+
+    def _do_summarize(self, text: str):
+        try:
+            lang = self.lang_var.get()
+            if lang == "auto":
+                lang = TextProcessor.detect_language(text)
+            ratio = self.ratio_var.get()
+
+            if self.compare_var.get():
+                self._run_compare_all(text, lang, ratio)
+            else:
+                algo_name = self.algo_var.get()
+                fn = ALGORITHMS[algo_name]
+                self.after(0, lambda: self.progress_var.set(30))
+                summary, stats = fn(text, ratio, lang)
+                self.after(0, lambda: self.progress_var.set(70))
+                metrics = self.calc.compute_all(text, summary,
+                                                stats["processing_time"], lang, algo_name)
+                self.after(0, lambda: self.progress_var.set(90))
+                self.summary_txt  = summary
+                self.metrics_data = metrics
+                self.after(0, self._update_ui, summary, metrics)
+        except Exception as e:
+            self.after(0, lambda: messagebox.showerror("Error", str(e)))
+        finally:
+            self.after(0, self._finish_run)
+
+    def _run_compare_all(self, text: str, lang: str, ratio: float):
+        results = []
+        n = len(ALGORITHMS)
+        self._compare_data = {}
+        for i, (name, fn) in enumerate(ALGORITHMS.items()):
+            self.after(0, lambda v=int((i/n)*80)+10: self.progress_var.set(v))
+            summary, stats = fn(text, ratio, lang)
+            metrics = self.calc.compute_all(text, summary,
+                                            stats["processing_time"], lang, name)
+            results.append((name, summary, metrics))
+            self._compare_data[name] = summary
+
+        self.after(0, self._populate_compare_tab, results)
+        # show best result (highest ROUGE-L) in editor
+        best = max(results, key=lambda x: x[2]["rouge_l"]["f1"])
+        self.summary_txt  = best[1]
+        self.metrics_data = best[2]
+        self.after(0, self._update_ui, best[1], best[2])
+        self.after(0, lambda: self.notebook.select(self.compare_tab))
+
+    def _populate_compare_tab(self, results):
+        for row in self.compare_tree.get_children():
+            self.compare_tree.delete(row)
+
+        best_score, best_name = -1, ""
+        for name, summary, m in results:
+            r1 = m["rouge_1"]["f1"]
+            r2 = m["rouge_2"]["f1"]
+            rl = m["rouge_l"]["f1"]
+            tc = m["topic_coverage"]
+            kf = m["key_fact_retention"]
+            comp = m["word_compression"]
+            ms   = round(m["processing_time"]*1000, 1)
+            wds  = m["summary_words"]
+            score = r1*0.3 + r2*0.2 + rl*0.1 + tc*0.25 + kf*0.15
+            if score > best_score:
+                best_score, best_name = score, name
+            self.compare_tree.insert("", "end", values=(
+                name, f"{r1:.4f}", f"{r2:.4f}", f"{rl:.4f}",
+                f"{tc:.4f}", f"{kf:.4f}", f"{comp:.1f}%", f"{ms}ms", wds),
+                tags=(name,))
+
+        # Color rows
+        for name, col in ALGO_COLORS.items():
+            self.compare_tree.tag_configure(name, foreground=col)
+
+        # Winner
+        best_m = next(m for n,s,m in results if n==best_name)
+        self.winner_label.config(text=f"🏆  {best_name}")
+        detail = (f"ROUGE-1: {best_m['rouge_1']['f1']:.4f}  |  "
+                  f"ROUGE-2: {best_m['rouge_2']['f1']:.4f}  |  "
+                  f"ROUGE-L: {best_m['rouge_l']['f1']:.4f}  |  "
+                  f"Topic Coverage: {best_m['topic_coverage']:.4f}  |  "
+                  f"Key-Fact Retention: {best_m['key_fact_retention']:.4f}  |  "
+                  f"Compression: {best_m['word_compression']:.1f}%  |  "
+                  f"Time: {best_m['processing_time']*1000:.1f}ms")
+        self.winner_detail.config(text=detail)
+
+    def _show_compare_summary(self, event=None):
+        sel = self.compare_tree.selection()
+        if not sel:
+            return
+        name = self.compare_tree.item(sel[0])["values"][0]
+        txt  = self._compare_data.get(name, "")
+        self.compare_summ.config(state="normal")
+        self.compare_summ.delete("1.0","end")
+        self.compare_summ.insert("1.0", txt)
+        self.compare_summ.config(state="disabled")
+
+    def _sort_tree(self, col):
+        items = [(self.compare_tree.set(k, col), k)
+                 for k in self.compare_tree.get_children('')]
+        try:
+            items.sort(key=lambda x: float(x[0].replace('%','').replace('ms','')),
+                       reverse=True)
+        except:
+            items.sort(reverse=False)
+        for idx, (_, k) in enumerate(items):
+            self.compare_tree.move(k, '', idx)
+
+    # ──────────────────────────────────────────────────────────
+    #  UPDATE UI
+    # ──────────────────────────────────────────────────────────
+
+    def _update_ui(self, summary: str, metrics: dict):
+        # Summary text
+        self.summ_text.config(state="normal")
+        self.summ_text.delete("1.0","end")
+        self.summ_text.insert("1.0", summary)
+        self.summ_text.config(state="disabled")
+
+        r1 = metrics.get("rouge_1",{})
+        r2 = metrics.get("rouge_2",{})
+        rl = metrics.get("rouge_l",{})
+
+        for key, val in [
+            ("r1f", f"{r1.get('f1',0):.4f}"),
+            ("r2f", f"{r2.get('f1',0):.4f}"),
+            ("rlf", f"{rl.get('f1',0):.4f}"),
+            ("r1p", f"{r1.get('precision',0):.4f}"),
+            ("r1r", f"{r1.get('recall',0):.4f}"),
+            ("r2p", f"{r2.get('precision',0):.4f}"),
+        ]:
+            if key in self.rouge_cards:
+                self.rouge_cards[key].update_value(val)
+
+        for key, val in [
+            ("tc",  f"{metrics.get('topic_coverage',0):.4f}"),
+            ("kfr", f"{metrics.get('key_fact_retention',0):.4f}"),
+            ("ldo", f"{metrics.get('lexical_diversity_orig',0):.4f}"),
+            ("lds", f"{metrics.get('lexical_diversity_summ',0):.4f}"),
+        ]:
+            if key in self.sem_cards:
+                self.sem_cards[key].update_value(val)
+
+        for key, val in [
+            ("wcomp", f"{metrics.get('word_compression',0):.1f}%"),
+            ("scomp", f"{metrics.get('sentence_compression',0):.1f}%"),
+            ("owds",  metrics.get("original_words",0)),
+            ("swds",  metrics.get("summary_words",0)),
+            ("osnt",  metrics.get("original_sentences",0)),
+            ("ssnt",  metrics.get("summary_sentences",0)),
+        ]:
+            if key in self.stat_cards:
+                self.stat_cards[key].update_value(val)
+
+        for key, val in [
+            ("algo", metrics.get("algorithm","—")),
+            ("lang", metrics.get("language","—")),
+            ("time", f"{metrics.get('processing_time',0)*1000:.1f}ms"),
+            ("och",  f"{metrics.get('original_chars',0):,}"),
+            ("sch",  f"{metrics.get('summary_chars',0):,}"),
+        ]:
+            if key in self.perf_cards:
+                self.perf_cards[key].update_value(val)
+
+        rl_f1 = rl.get("f1", 0)
+        self.quality_bar["value"] = rl_f1
+        color = "#27AE60" if rl_f1 > 0.4 else "#E67E22" if rl_f1 > 0.2 else "#E74C3C"
+        self.quality_pct.config(text=f"{rl_f1*100:.1f}%", fg=color)
+
+        self.raw_text.config(state="normal")
+        self.raw_text.delete("1.0","end")
+        self.raw_text.insert("1.0", json.dumps(metrics, indent=2, ensure_ascii=False))
+        self.raw_text.config(state="disabled")
+
+        # History
+        fname = os.path.basename(self.current_file) if self.current_file else "text"
+        algo  = metrics.get("algorithm","?")
+        entry = f"{fname} → {algo} (R-L:{rl_f1:.3f})"
+        self.history.append((self.original_txt, summary, metrics))
+        self.history_list.insert("end", entry)
+        self.history_list.see("end")
+
+        self._set_status(f"✅ Done  |  {algo}  |  ROUGE-L: {rl_f1:.4f}  |  "
+                         f"Compression: {metrics.get('word_compression',0):.1f}%")
+
+    def _finish_run(self):
+        self.is_running = False
+        self.run_btn.set_state("normal")
+        self.run_btn.set_command(self._run_summarization)
+        self.progress_var.set(100)
+        self.after(800, lambda: self.progress_var.set(0))
+
+    # ──────────────────────────────────────────────────────────
+    #  EXPORT
+    # ──────────────────────────────────────────────────────────
+
+    def _export(self, fmt: str):
+        if not self.summary_txt:
+            messagebox.showwarning("No Summary", "Run summarization first.")
+            return
+        ext   = ".docx" if fmt=="docx" else ".pdf"
+        ftype = [("Word","*.docx")] if fmt=="docx" else [("PDF","*.pdf")]
+        path  = filedialog.asksaveasfilename(defaultextension=ext,
+                                              filetypes=ftype,
+                                              initialfile=f"summary{ext}")
+        if not path:
+            return
+        lang = self.lang_var.get()
+        if lang == "auto":
+            lang = TextProcessor.detect_language(self.summary_txt)
+        self._set_status(f"Exporting {fmt.upper()} …")
+        try:
+            if fmt == "docx":
+                self.doc_handler.export_docx(self.summary_txt, self.current_file,
+                                              self.metrics_data, path, lang)
+            else:
+                self.doc_handler.export_pdf(self.summary_txt, self.current_file,
+                                             self.metrics_data, path, lang)
+            self._set_status(f"✅ Exported: {os.path.basename(path)}")
+            messagebox.showinfo("Export Successful", f"Saved:\n{path}")
+        except Exception as e:
+            messagebox.showerror("Export Error", str(e))
+            self._set_status("Export failed")
+
+    # ──────────────────────────────────────────────────────────
+    #  THEME
+    # ──────────────────────────────────────────────────────────
+
+    def _apply_theme(self):
+        t = self.theme
+        self.configure(bg=t["bg"])
+        self.header.configure(bg=t["header_bg"])
+        self._tcolor(self.header, t, is_header=True)
+        self.sidebar.configure(bg=t["sidebar"])
+        self.sb_inner.configure(bg=t["sidebar"])
+        self._tcolor(self.sb_inner, t, is_sidebar=True)
+        self.main.configure(bg=t["bg"])
+        for tab in [self.editor_tab, self.metrics_tab, self.compare_tab]:
+            tab.configure(bg=t["bg"])
+            self._tcolor(tab, t)
+        for tb in [self.orig_text, self.summ_text]:
+            tb.configure(bg=t["input_bg"], fg=t["text"],
+                         insertbackground=t["text"], selectbackground=t["highlight"])
+        self.statusbar.configure(bg=t["header_bg"])
+        for w in self.statusbar.winfo_children():
+            try:
+                w.configure(bg=t["header_bg"], fg=t["header_txt"])
+            except:
+                pass
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure("TNotebook", background=t["bg"], borderwidth=0)
+        style.configure("TNotebook.Tab", background=t["card"],
+                        foreground=t["text"], padding=[12,4])
+        style.map("TNotebook.Tab",
+                  background=[("selected", t["primary"])],
+                  foreground=[("selected","#FFFFFF")])
+        style.configure("Treeview", background=t["card"],
+                        foreground=t["text"], fieldbackground=t["card"])
+        style.configure("Treeview.Heading",
+                        background=t["primary"], foreground="#FFFFFF")
+
+    def _tcolor(self, widget, t, is_sidebar=False, is_header=False):
+        for w in widget.winfo_children():
+            try:
+                cls = w.winfo_class()
+                bg = t["sidebar"] if is_sidebar else (t["header_bg"] if is_header else t["bg"])
+                fg = t["sidebar_txt"] if (is_sidebar or is_header) else t["text"]
+                if cls in ("Frame","Labelframe"):
+                    w.configure(bg=bg)
+                elif cls == "Label":
+                    w.configure(bg=bg, fg=fg)
+                elif cls in ("Checkbutton","Radiobutton"):
+                    w.configure(bg=bg, fg=fg, selectcolor=bg, activebackground=bg)
+                elif cls == "Button":
+                    if is_sidebar or is_header:
+                        w.configure(bg=bg, fg=fg, activebackground=t["primary"],
+                                    activeforeground="#FFF")
+                    else:
+                        w.configure(bg=t["card"], fg=t["text"],
+                                    activebackground=t["primary"],
+                                    activeforeground="#FFF",
+                                    highlightbackground=t["card_bdr"])
+                elif cls == "Listbox":
+                    w.configure(bg=t["input_bg"], fg=t["text"],
+                                selectbackground=t["highlight"])
+                elif cls == "Text":
+                    w.configure(bg=t["input_bg"], fg=t["text"])
+            except:
+                pass
+            self._tcolor(w, t, is_sidebar, is_header)
+
+    def _toggle_theme(self):
+        self.dark_mode = not self.dark_mode
+        self.theme = DARK if self.dark_mode else LIGHT
+        self.dark_btn.config(text="☀️ Light" if self.dark_mode else "🌙 Dark")
+        self._apply_theme()
+
+    # ──────────────────────────────────────────────────────────
+    #  MISC
+    # ──────────────────────────────────────────────────────────
+
+    def _clear_all(self):
+        self.orig_text.delete("1.0","end")
+        self.summ_text.config(state="normal")
+        self.summ_text.delete("1.0","end")
+        self.summ_text.config(state="disabled")
+        self.original_txt = self.summary_txt = ""
+        self.metrics_data = {}
+        self.current_file = ""
+        self.file_label.config(text="No file selected")
+        for cards in [self.rouge_cards, self.sem_cards, self.stat_cards, self.perf_cards]:
+            for c in cards.values():
+                c.update_value("—")
+        self.quality_bar["value"] = 0
+        self.quality_pct.config(text="0.0%")
+        self._set_status("Cleared  |  تم المسح")
+
+    def _load_history(self, event=None):
+        sel = self.history_list.curselection()
+        if not sel or sel[0] >= len(self.history):
+            return
+        orig, summ, met = self.history[sel[0]]
+        self._set_original(orig)
+        self._update_ui(summ, met)
+
+    def _update_wc(self, event=None):
+        wc = len(self.orig_text.get("1.0","end").split())
+        self.wc_var.set(f"{wc:,} words")
+
+    def _set_status(self, msg: str):
+        self.status_var.set(msg)
+
+    def _show_help(self):
+        win = tk.Toplevel(self)
+        win.title("Help  |  تعليمات")
+        win.geometry("600x580")
+        t = tk.Text(win, font=("Segoe UI",10), wrap="word",
+                    padx=14, pady=10, relief="flat")
+        t.pack(fill="both", expand=True)
+        t.insert("1.0", """
+📄 Technical Document Summarizer v3.0 — Help / تعليمات
+═══════════════════════════════════════════════════════
+
+🚀 QUICK START / البداية السريعة:
+  1. Click "Word / PDF" to import a file   — or —  "Paste Text"
+  2. Choose language (Auto-detect works well)
+  3. Pick an algorithm  — or —  check "Compare ALL algorithms"
+  4. Set the summary ratio (30% = keep 30% of sentences)
+  5. Click ✨ Summarize
+  6. View results in Editor / Metrics / Compare tabs
+  7. Export as DOCX or PDF
+
+⚙️ ALGORITHMS / الخوارزميات:
+  • TF-IDF Extractive      — Scores by TF-IDF weight. Fast & precise.
+  • TextRank (Graph-Based) — PageRank on sentence similarity graph.
+                             Best for long complex documents.
+  • LSA (Latent Semantic)  — SVD to find latent topics.
+                             Best for multi-topic documents.
+  • Frequency-Based        — Simple word frequency scoring. Fastest.
+
+📊 METRICS / المقاييس:
+  • ROUGE-1/2    — Word/bigram overlap with original. Range 0–1.
+  • ROUGE-L      — Longest common subsequence. Reflects coherence.
+  • Topic Coverage       — % of original topic clusters represented.
+  • Key-Fact Retention   — % of top-30 keywords kept in summary.
+  • Compression %        — How much text was reduced.
+  • Lexical Diversity    — Type-Token Ratio (vocabulary richness).
+  • Processing Time      — Algorithm runtime in milliseconds.
+
+🔀 COMPARE MODE / وضع المقارنة:
+  Check "Compare ALL algorithms" to run all 4 simultaneously.
+  The Compare tab shows a sortable table. Click any row to read
+  that algorithm's summary. The winner is highlighted.
+
+💾 EXPORT / التصدير:
+  • DOCX — Styled Word document with summary + metrics table.
+  • PDF  — Professional PDF with colors and table.
+
+🌐 LANGUAGES / اللغات:
+  • Auto-detect: compares Arabic vs Latin character density.
+  • Arabic: normalizes alef/yeh/teh, uses Arabic stop words.
+  • English: standard NLP preprocessing.
+""")
+        t.config(state="disabled")
+
+
+# ══════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ══════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    app = SummarizerApp()
+    app.mainloop()
